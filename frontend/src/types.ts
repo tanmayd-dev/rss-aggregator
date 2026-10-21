@@ -8,6 +8,11 @@ export interface FeedSource {
   config: string | null;
   resolvedUrl: string | null;
   lastFetched: string | null;
+  /** Scheduled slot for the next automatic refresh (null for on-demand feeds). */
+  nextRefreshAt?: string | null;
+  lastAttemptAt?: string | null;
+  consecutiveFailures?: number;
+  lastError?: string | null;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -72,4 +77,25 @@ export interface ScrapedFeedItem {
     tim?: number;
     ext?: string;
   } | null;
+}
+
+/** One refresh tick, as recorded by the backend and plotted in the activity graph. */
+export interface RefreshRun {
+  id: string;
+  startedAt: string;
+  finishedAt: string | null;
+  budget: number;
+  due: number;
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  durationMs: number | null;
+}
+
+export interface RefreshRunsResponse {
+  runs: RefreshRun[];
+  lastRun: RefreshRun | null;
+  currentBudget: number;
+  tickIntervalMinutes: number;
+  running: boolean;
 }

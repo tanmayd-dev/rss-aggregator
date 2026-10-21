@@ -324,7 +324,16 @@ async function runTests() {
     if (rssRequestCount !== 5) {
       throw new Error(`Plain GET should serve cache when stored TTL is unexpired (fetches: ${rssRequestCount})`);
     }
-    console.log('  [OK] ?ttl=0 forces refresh; unexpired stored TTL serves cache');
+    // POST refresh is staleness-checked; ?force=1 bypasses the check.
+    await axios.post(`${BASE_URL}/api/feeds/${ttlFeedId}/refresh`);
+    if (rssRequestCount !== 5) {
+      throw new Error(`POST refresh on a fresh feed should not fetch (fetches: ${rssRequestCount})`);
+    }
+    await axios.post(`${BASE_URL}/api/feeds/${ttlFeedId}/refresh?force=1`);
+    if (rssRequestCount !== 6) {
+      throw new Error(`POST refresh?force=1 must fetch (fetches: ${rssRequestCount})`);
+    }
+    console.log('  [OK] ?ttl=0 forces refresh; POST refresh is staleness-checked; ?force=1 overrides');
 
     // --- Duplicate sources in one feed are fetched only once per run ---
     const dupFeed = await axios.post(`${BASE_URL}/api/feeds`, {
@@ -341,12 +350,12 @@ async function runTests() {
       throw new Error('Dedup feed should keep both source rows');
     }
     // Create-time scrape: source 1 fetched, duplicate source 2 reuses its items
-    if (rssRequestCount !== 6) {
+    if (rssRequestCount !== 7) {
       throw new Error(`Duplicate sources should be fetched once on create (fetches: ${rssRequestCount})`);
     }
 
     const dupXmlRes = await axios.get(`${BASE_URL}/feeds/${dupFeedId}?ttl=0`);
-    if (rssRequestCount !== 7) {
+    if (rssRequestCount !== 8) {
       throw new Error(`Duplicate sources should be fetched once on force refresh (fetches: ${rssRequestCount})`);
     }
     const rssParser = new (await import('rss-parser')).default();

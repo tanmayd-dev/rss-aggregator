@@ -23,17 +23,23 @@ model Feed {
 }
 
 model FeedSource {
-  id           String     @id @default(uuid())
-  feedId       String
-  feed         Feed       @relation(fields: [feedId], references: [id], onDelete: Cascade)
-  url          String
-  type         String     // 'rss' | 'html' | 'reddit' | 'youtube' | 'fourchan'
-  resolvedUrl  String?
-  config       String?    // JSON string for source-specific config
-  lastFetched  DateTime?
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @updatedAt
-  items        FeedItem[]
+  id                  String     @id @default(uuid())
+  feedId              String
+  feed                Feed       @relation(fields: [feedId], references: [id], onDelete: Cascade)
+  url                 String
+  type                String     // 'rss' | 'html' | 'reddit' | 'youtube' | 'fourchan'
+  resolvedUrl         String?
+  config              String?    // JSON string for source-specific config
+  lastFetched         DateTime?  // last successful fetch
+  nextRefreshAt       DateTime?  // scheduled slot; null until first rebalance
+  lastAttemptAt       DateTime?  // last attempt, success or failure
+  consecutiveFailures Int        @default(0)
+  lastError           String?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+  items               FeedItem[]
+
+  @@index([nextRefreshAt])
 }
 
 model FeedItem {
@@ -52,4 +58,18 @@ model FeedItem {
   createdAt     DateTime    @default(now())
 
   @@unique([feedId, link])
+}
+
+// One row per refresh tick (cron every 5 minutes). The newest row decides the next
+// tick's adaptive budget; older rows feed the activity graph. Pruned after 7 days.
+model RefreshRun {
+  id         String    @id @default(uuid())
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  budget     Int       @default(0)
+  due        Int       @default(0)
+  attempted  Int       @default(0)
+  succeeded  Int       @default(0)
+  failed     Int       @default(0)
+  durationMs Int?
 }

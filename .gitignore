@@ -6,6 +6,8 @@ node_modules
 /src/generated/prisma
 *.db
 *.db-journal
+/refresh.log
+/prisma/.refresh.lock
 /.freebuff
 /yt_sample.html
 /yt_rss_sample.xml

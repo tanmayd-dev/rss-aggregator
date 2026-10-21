@@ -3,9 +3,11 @@ import {
   Sun, Moon, Trash2, Copy, Check, Plus, 
   RefreshCw, AlertCircle, Link, Rss, Youtube, 
   MessageSquare, Globe, X, ExternalLink, Settings,
-  Inbox, MailOpen, CheckCheck
+  Inbox, MailOpen, CheckCheck, ChevronDown, ChevronUp,
+  Activity, Clock
 } from 'lucide-react';
-import { Feed, FeedItem, FeedType, ScrapedFeedItem } from './types.js';
+import { Feed, FeedItem, FeedType, ScrapedFeedItem, RefreshRun, RefreshRunsResponse } from './types.js';
+import RefreshChart from './components/RefreshChart.js';
 
 export default function App() {
   // Theme state
@@ -31,6 +33,11 @@ export default function App() {
     url: string;
     type: FeedType;
     config: any;
+    lastFetched?: string | null;
+    nextRefreshAt?: string | null;
+    lastAttemptAt?: string | null;
+    consecutiveFailures?: number;
+    lastError?: string | null;
     testResult?: { count: number; items: ScrapedFeedItem[] } | null;
     testError?: string | null;
     testing?: boolean;
@@ -56,7 +63,16 @@ export default function App() {
 
   const [copiedFeedId, setCopiedFeedId] = useState<string | null>(null);
   const [refreshingFeedId, setRefreshingFeedId] = useState<string | null>(null);
+  const [refreshingSourceId, setRefreshingSourceId] = useState<string | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
+
+  // Refresh activity panel
+  const [activityOpen, setActivityOpen] = useState<boolean>(false);
+  const [runs, setRuns] = useState<RefreshRun[]>([]);
+  const [runsMeta, setRunsMeta] = useState<RefreshRunsResponse | null>(null);
+  const [runsLoading, setRunsLoading] = useState<boolean>(false);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [runsRange, setRunsRange] = useState<number>(24);
 
   // Items reader state
   const [itemsModalOpen, setItemsModalOpen] = useState<boolean>(false);
@@ -211,7 +227,7 @@ export default function App() {
   const handleRefreshFeed = async (id: string) => {
     setRefreshingFeedId(id);
     try {
-      const res = await fetch(`/api/feeds/${id}/refresh`, { method: 'POST' });
+      const res = await fetch(`/api/feeds/${id}/refresh?force=1`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to refresh feed cache');
       await fetchFeeds();
@@ -221,6 +237,64 @@ export default function App() {
       setRefreshingFeedId(null);
     }
   };
+
+  // Load recent refresh ticks for the activity graph
+  const loadRuns = async () => {
+    setRunsLoading(true);
+    try {
+      const res = await fetch('/api/refresh/runs?hours=168');
+      if (!res.ok) throw new Error('Failed to load refresh activity');
+      const data: RefreshRunsResponse = await res.json();
+      setRuns(data.runs);
+      setRunsMeta(data);
+      setRunsError(null);
+    } catch (err: any) {
+      setRunsError(err.message || 'Failed to load refresh activity');
+    } finally {
+      setRunsLoading(false);
+    }
+  };
+
+  const toggleActivity = () => {
+    const next = !activityOpen;
+    setActivityOpen(next);
+    if (next && runs.length === 0 && !runsLoading) {
+      loadRuns();
+    }
+  };
+
+  // Force-refresh one source, then re-anchor its schedule in the editor
+  const handleRefreshSource = async (sourceId: string) => {
+    setRefreshingSourceId(sourceId);
+    try {
+      const res = await fetch(`/api/sources/${sourceId}/refresh`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to refresh source');
+      if (data.failed) throw new Error(data.error || 'Source refresh failed');
+
+      const updated = data.source;
+      setFormSources((prev) =>
+        prev.map((source) =>
+          source.id === sourceId
+            ? {
+                ...source,
+                lastFetched: updated.lastFetched,
+                nextRefreshAt: updated.nextRefreshAt,
+                lastAttemptAt: updated.lastAttemptAt,
+                consecutiveFailures: updated.consecutiveFailures,
+                lastError: updated.lastError,
+              }
+            : source
+        )
+      );
+      fetchFeeds();
+    } catch (err: any) {
+      alert(`Error refreshing source: ${err.message}`);
+    } finally {
+      setRefreshingSourceId(null);
+    }
+  };
+
 
   // Run Real-time Selector Test for a specific source row
   const handleTestSource = async (index: number) => {
@@ -326,6 +400,11 @@ export default function App() {
       url: source.url,
       type: source.type,
       config: source.config ? JSON.parse(source.config) : getInitialConfigForType(source.type),
+      lastFetched: source.lastFetched,
+      nextRefreshAt: source.nextRefreshAt,
+      lastAttemptAt: source.lastAttemptAt,
+      consecutiveFailures: source.consecutiveFailures,
+      lastError: source.lastError,
     }));
     setFormSources(mappedSources);
     setIsModalOpen(true);
@@ -353,6 +432,29 @@ export default function App() {
       minute: '2-digit',
     });
   };
+
+  // Soonest scheduled source check in a feed (for the table tooltip)
+  const nextSourceCheck = (feed: Feed): string | null => {
+    const times = feed.sources
+      .map((source) => source.nextRefreshAt)
+      .filter((value): value is string => Boolean(value));
+    if (times.length === 0) return null;
+    return times.reduce((earliest, current) =>
+      new Date(current).getTime() < new Date(earliest).getTime() ? current : earliest
+    );
+  };
+
+  // Last tick summary shown in the collapsed activity strip
+  const activityLastRun = runsMeta?.lastRun ?? runs[runs.length - 1] ?? null;
+  const activityBudget = runsMeta?.currentBudget ?? activityLastRun?.budget ?? 4;
+  const nextTickLabel = (() => {
+    if (!activityLastRun?.finishedAt) return null;
+    const dueAt =
+      new Date(activityLastRun.finishedAt).getTime() +
+      (runsMeta?.tickIntervalMinutes ?? 5) * 60 * 1000;
+    const minutes = Math.round((dueAt - Date.now()) / 60000);
+    return minutes > 0 ? `in ~${minutes}m` : 'due now';
+  })();
 
   // Strip HTML tags for the item snippet
   const stripHtml = (html: string) => html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -424,6 +526,93 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* REFRESH ACTIVITY PANEL */}
+        <div className="mb-6 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl shadow-sm overflow-hidden">
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={toggleActivity}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                toggleActivity();
+              }
+            }}
+            className="w-full px-6 py-3 flex items-center justify-between gap-4 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/40 transition"
+          >
+            <span className="flex items-center gap-2 font-semibold text-sm shrink-0">
+              <Activity className="w-4 h-4 text-indigo-500" />
+              <span>Refresh activity</span>
+            </span>
+            <span className="flex items-center gap-2 text-[11px] text-gray-500 dark:text-gray-400 text-right">
+              {runsLoading && runs.length === 0 ? (
+                <span>Loading ticks…</span>
+              ) : activityLastRun ? (
+                <>
+                  {nextTickLabel && <span>next tick {nextTickLabel}</span>}
+                  <span aria-hidden="true">·</span>
+                  <span>budget {activityBudget}</span>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    last tick {activityLastRun.attempted}/{activityLastRun.budget}
+                  </span>
+                  {activityLastRun.due > activityLastRun.budget && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                        due {activityLastRun.due}
+                      </span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <span>No ticks recorded yet</span>
+              )}
+              {activityOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </span>
+          </div>
+
+          {activityOpen && (
+            <div className="px-6 pb-5 border-t border-gray-200 dark:border-gray-800">
+              <div className="flex items-center justify-between py-3">
+                <div className="inline-flex rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden text-xs">
+                  {([
+                    [6, '6h'],
+                    [24, '24h'],
+                    [168, '7d'],
+                  ] as const).map(([hours, label]) => (
+                    <button
+                      key={hours}
+                      onClick={() => setRunsRange(hours)}
+                      className={`px-3 py-1.5 font-semibold transition ${
+                        runsRange === hours
+                          ? 'bg-indigo-600 text-white'
+                          : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  onClick={loadRuns}
+                  disabled={runsLoading}
+                  className="p-1.5 text-gray-500 hover:text-indigo-600 dark:text-gray-400 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition disabled:opacity-50"
+                  title="Reload tick history"
+                >
+                  <RefreshCw className={`w-4 h-4 ${runsLoading ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+
+              {runsError && (
+                <div className="mb-3 text-xs text-red-600 dark:text-red-400">{runsError}</div>
+              )}
+
+              <RefreshChart runs={runs} rangeHours={runsRange} />
+            </div>
+          )}
+        </div>
 
         {/* FEED TABLE LIST */}
         <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl overflow-hidden shadow-sm">
@@ -508,7 +697,14 @@ export default function App() {
                           <span className="text-xs text-gray-300 dark:text-gray-600">—</span>
                         )}
                       </td>
-                      <td className="px-6 py-4 align-middle text-center font-medium">
+                      <td
+                        className="px-6 py-4 align-middle text-center font-medium"
+                        title={
+                          nextSourceCheck(feed)
+                            ? `Next source check: ${formatDate(nextSourceCheck(feed))}`
+                            : undefined
+                        }
+                      >
                         {feed.ttl === 0 ? (
                           <span 
                             className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold leading-none bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300"
@@ -984,6 +1180,40 @@ export default function App() {
                               <span>Test</span>
                             </button>
                           </div>
+                        </div>
+                      )}
+
+                      {/* Existing source: schedule, failures and manual refresh */}
+                      {source.id && (
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 mt-2 text-[11px] text-gray-500 dark:text-gray-400">
+                          <span className="inline-flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            {source.nextRefreshAt
+                              ? `Next check ${formatDate(source.nextRefreshAt)}`
+                              : 'Auto-refresh off'}
+                          </span>
+                          <span>Last ok: {formatDate(source.lastFetched ?? null)}</span>
+                          {(source.consecutiveFailures ?? 0) > 0 && (
+                            <span
+                              className="inline-flex items-center gap-1 text-red-600 dark:text-red-400 font-semibold"
+                              title={source.lastError || 'Last fetch failed'}
+                            >
+                              <AlertCircle className="w-3 h-3" />
+                              {source.consecutiveFailures} failure
+                              {(source.consecutiveFailures ?? 0) > 1 ? 's' : ''}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleRefreshSource(source.id!)}
+                            disabled={refreshingSourceId === source.id}
+                            className="inline-flex items-center gap-1 font-semibold text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 disabled:opacity-50 transition"
+                          >
+                            <RefreshCw
+                              className={`w-3 h-3 ${refreshingSourceId === source.id ? 'animate-spin' : ''}`}
+                            />
+                            Refresh now
+                          </button>
                         </div>
                       )}
 

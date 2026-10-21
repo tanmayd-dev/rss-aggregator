@@ -24,8 +24,11 @@ npx prisma migrate deploy        # apply existing
 npx prisma migrate dev           # create a new migration after editing schema.prisma
 npx prisma generate              # re-run after any schema change
 
-npm run dev                      # backend with tsx watch (port 3000)
+npm run dev                      # backend with tsx watch (port 3000, loopback)
 cd frontend && npm run dev       # vite dev server on :5173, proxies /api and /feeds to :3000
+
+# Trigger one refresh tick by hand (cron does this every 5 min in production)
+curl -X POST http://127.0.0.1:3000/api/refresh/tick
 ```
 
 Order matters on a fresh checkout: `npm install` -> `prisma generate` -> `migrate deploy`
@@ -48,10 +51,26 @@ Order matters on a fresh checkout: `npm install` -> `prisma generate` -> `migrat
 
 ## API semantics worth knowing
 
-- `ttl` on a feed: minutes between auto-refreshes. `ttl = 0` means auto-refresh is
-  disabled — the feed is only fetched if never fetched, or on explicit refresh
-  (`?ttl=0` on `GET /feeds/:id`, or `POST /api/feeds/:id/refresh`). This is intentional,
-  not a bug (vestige of the removed Zen integration).
+- `ttl` on a feed: minutes per full refresh cycle, shared by all its sources. The
+  **cron tick** (`POST /api/refresh/tick`, every 5 min over loopback) refreshes one
+  source per slot, spread evenly across the TTL and aligned to UTC clock boundaries
+  (1h/4 sources -> xx:00, xx:15, xx:30, xx:45). The 5-minute tick is the granularity,
+  so TTLs below 5 are effectively 5. `ttl = 0` disables auto-refresh — the tick only
+  seeds never-fetched sources; refresh explicitly via `?ttl=0` on `GET /feeds/:id`,
+  `POST /api/feeds/:id/refresh`, or `POST /api/sources/:id/refresh`.
+- Each source stores its schedule in `FeedSource.nextRefreshAt` (plus `lastFetched`,
+  `lastAttemptAt`, `consecutiveFailures`, `lastError`). Adding/removing sources or
+  changing the TTL rebalances every source in that feed (`rebalanceFeed`). Failed
+  sources retry with exponential backoff (5, 10, 20 … capped at `min(TTL, 60)` min).
+- The tick budget adapts to the previous tick: `max(4, ceil(previousAttempted * 1.5))`,
+  capped by `REFRESH_MAX_PER_TICK` (default 64). That drains a post-downtime backlog
+  while keeping normal ticks small. Each tick is recorded in `RefreshRun` (pruned after
+  7 days) and graphed by the dashboard's "Refresh activity" panel.
+- Plain `GET /feeds/:id` is cache-only and never scrapes. Passing `?ttl=` explicitly
+  requests a staleness-checked refresh (`?ttl=0` forces). `POST /api/feeds/:id/refresh`
+  is also staleness-checked; `?force=1` bypasses it.
+- `PUT /api/feeds/:id` rebalances the feed, then fetches new/changed sources plus any
+  source already due; unchanged fresh sources are not re-scraped.
 - `POST /api/items/read` with no `ids`/`feedId` marks **every** unread item read.
 
 ## Tests
@@ -66,13 +85,19 @@ Order matters on a fresh checkout: `npm install` -> `prisma generate` -> `migrat
 
 ## Deployment
 
-systemd **user** service; unit template lives in the repo (`systemd/rss-server.service`).
+API runs as a systemd **user** service; periodic refreshes run from **crontab**.
+Unit template: `systemd/rss-server.service`. Cron log: `refresh.log` at the repo root.
+The unit sets `HOST=127.0.0.1`; the tick endpoint rejects non-loopback requests.
 
 ```bash
-./systemd/install.sh                    # renders unit with absolute repo paths -> ~/.config/systemd/user/
+./systemd/install.sh                    # renders unit + installs the 5-min crontab entry
+# ./systemd/install.sh --no-cron        # API unit only
 systemctl enable --now --user rss-server
 systemctl --user restart rss-server     # after rebuilds (npm run build in both dirs first)
+crontab -l                              # look for the rss-aggregator-refresh line
 ```
 
-The installed unit bakes in absolute paths at install time — if the repo moves, re-run
-`install.sh`. `loginctl enable-linger $USER` is needed for boot start before login.
+`install.sh` bakes absolute repo paths into both the unit and the cron line — if the
+repo moves, re-run it. `loginctl enable-linger $USER` is needed for boot start before
+login. The cron line just curls the tick endpoint, so a tick cannot overlap itself: the
+server returns `409` while a tick is still running.

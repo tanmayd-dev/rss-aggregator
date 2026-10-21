@@ -3,8 +3,23 @@ import { prisma } from './services/db.js';
 import * as feedManager from './services/feedManager.js';
 import * as feedGenerator from './services/feedGenerator.js';
 import * as scraper from './services/scraper.js';
+import { nextBudget, TICK_INTERVAL_MINUTES } from './services/scheduler.js';
 
 export const router = Router();
+
+/**
+ * The refresh tick is meant for the local cron entrypoint only. The server binds to
+ * loopback by default; this guards against a misconfigured HOST exposing the endpoint.
+ */
+function isLoopback(req: Request): boolean {
+  const address = req.socket.remoteAddress || '';
+  return (
+    address === '::1' ||
+    address === '::ffff:127.0.0.1' ||
+    address === '127.0.0.1' ||
+    address.startsWith('127.')
+  );
+}
 
 /**
  * Health check endpoint
@@ -65,7 +80,8 @@ router.post('/api/feeds', async (req: Request, res: Response) => {
     });
 
     try {
-      await feedManager.updateFeedIfNeeded(feed.id, 0);
+      // Seed the cache once on creation. Later refreshes are cron-driven (or explicit).
+      await feedManager.refreshFeed(feed.id, feed.ttl);
     } catch (scrapeErr) {
       console.error(`Initial scrape failed for feed ${feed.id}:`, scrapeErr);
     }
@@ -196,14 +212,20 @@ router.put('/api/feeds/:id', async (req: Request, res: Response) => {
         if (source.id) {
           // Update existing source
           const existingSource = currentFeed.sources.find((s) => s.id === source.id);
+          const urlChanged = source.url !== existingSource?.url;
+          const typeChanged = source.type !== existingSource?.type;
+          const configChanged = configString !== (existingSource?.config ?? null);
+          const changed = urlChanged || typeChanged || configChanged;
           await tx.feedSource.update({
             where: { id: source.id },
             data: {
               url: source.url,
               type: source.type,
               config: configString,
+              // A changed definition needs a fresh fetch; unchanged fresh sources stay cached.
+              lastFetched: changed ? null : undefined,
               // If the URL changed, reset resolvedUrl so it re-resolves
-              resolvedUrl: source.url !== existingSource?.url ? null : undefined,
+              resolvedUrl: urlChanged || typeChanged ? null : undefined,
             },
           });
         } else {
@@ -226,8 +248,16 @@ router.put('/api/feeds/:id', async (req: Request, res: Response) => {
     });
 
     if (result) {
+      // New/removed/changed sources shift everyone's slot: rebalance before fetching so
+      // the feed's sources stay evenly spread across its TTL.
+      await feedManager.rebalanceFeed(result.id);
       try {
-        await feedManager.updateFeedIfNeeded(result.id, 0);
+        // Staleness check: only new/changed/stale sources are fetched, not everything.
+        await feedManager.refreshFeed(
+          result.id,
+          result.ttl,
+          result.ttl === 0 ? { disabled: true } : {}
+        );
       } catch (scrapeErr) {
         console.error(`Scrape on update failed for feed ${result.id}:`, scrapeErr);
       }
@@ -442,49 +472,130 @@ router.post('/api/feeds/test', async (req: Request, res: Response) => {
 });
 
 /**
- * Force refresh a feed cache immediately and return the updated feed
+ * Refresh a feed cache on demand. Staleness-checked: fresh feeds return cached data
+ * without any network work. Pass ?force=1 (or ?force=true) to fetch regardless of TTL.
  */
 router.post('/api/feeds/:id/refresh', async (req: Request, res: Response) => {
   const id = req.params.id as string;
   try {
-    const feed = await prisma.feed.findUnique({ where: { id } });
+    const feed = await prisma.feed.findUnique({ where: { id }, include: { sources: true } });
     if (!feed) {
       res.status(404).json({ error: 'Feed not found' });
       return;
     }
-    const updatedFeed = await feedManager.updateFeedIfNeeded(id, 0, { force: true });
-    res.json(updatedFeed);
+
+    // TTL 0 feeds are never picked up by cron, so an on-demand request always fetches them.
+    const force = req.query.force === '1' || req.query.force === 'true';
+    const outcome = await feedManager.refreshFeed(id, feed.ttl, { force });
+
+    res.setHeader('X-Feed-Refreshed', String(outcome.refreshed));
+    res.setHeader('X-Feed-Stale', String(feedManager.isFeedStale(outcome.feed)));
+    res.json(outcome.feed);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 });
 
 /**
+ * Cron entrypoint. Invoked by a local 5-minute crontab entry via curl:
+ *   curl -fsS -X POST http://127.0.0.1:3000/api/refresh/tick
+ *
+ * Fetches only sources whose scheduled slot has arrived (plus new/never-fetched ones),
+ * bounded by an adaptive per-tick budget. Returns 409 when a tick is still running.
+ */
+router.post('/api/refresh/tick', async (req: Request, res: Response) => {
+  if (!isLoopback(req)) {
+    res.status(403).json({ error: 'Refresh ticks are only accepted from loopback' });
+    return;
+  }
+
+  try {
+    const result = await feedManager.runRefreshTick();
+    res.json(result);
+  } catch (error: any) {
+    if (error?.code === 'TICK_RUNNING') {
+      res.status(409).json({ error: error.message, skipped: true });
+      return;
+    }
+    console.error('Refresh tick failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Recent tick history for the activity graph. `hours` defaults to 24 (max 168 = 7 days).
+ */
+router.get('/api/refresh/runs', async (req: Request, res: Response) => {
+  try {
+    const requested = parseInt(req.query.hours as string, 10);
+    const hours = Number.isNaN(requested) ? 24 : Math.min(Math.max(requested, 1), 168);
+    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+
+    const [runs, lastRun] = await Promise.all([
+      prisma.refreshRun.findMany({
+        where: { startedAt: { gte: since } },
+        orderBy: { startedAt: 'asc' },
+        take: 5000,
+      }),
+      prisma.refreshRun.findFirst({ orderBy: { startedAt: 'desc' } }),
+    ]);
+
+    res.json({
+      runs,
+      lastRun,
+      currentBudget: nextBudget(lastRun?.attempted),
+      tickIntervalMinutes: TICK_INTERVAL_MINUTES,
+      running: feedManager.isTickRunning(),
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Force-refresh a single source (per-source refresh button in the UI).
+ */
+router.post('/api/sources/:id/refresh', async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  try {
+    const { source, outcome } = await feedManager.refreshSource(id);
+    res.setHeader('X-Source-Refreshed', String(outcome.fetched));
+    res.json({
+      source,
+      fetched: outcome.fetched,
+      failed: outcome.failed,
+      itemCount: outcome.itemCount,
+      ...(outcome.error ? { error: outcome.error } : {}),
+    });
+  } catch (error: any) {
+    if (String(error?.message || '').startsWith('Source not found')) {
+      res.status(404).json({ error: 'Source not found' });
+      return;
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Fetch and return the generated RSS XML feed.
- * TTL is determined dynamically:
- * 1. From the link query parameter (?ttl=30)
- * 2. Stored feed TTL
- * 3. Default to 15 minutes
+ *
+ * Plain requests are read-only: they serve the cached items and never scrape. Refresh
+ * is handled by the 5-minute cron tick (POST /api/refresh/tick). Passing ?ttl=<minutes>
+ * explicitly requests a staleness-checked refresh (?ttl=0 forces one) for clients that
+ * want on-demand updates.
  */
 router.get('/feeds/:id', async (req: Request, res: Response) => {
   const id = req.params.id as string;
 
   try {
-    const feed = await prisma.feed.findUnique({ where: { id } });
+    let feed = await prisma.feed.findUnique({
+      where: { id },
+      include: { sources: true, items: { include: { source: true } } },
+    });
     if (!feed) {
       res.status(404).send('Feed not found');
       return;
     }
-
-    // TTL is determined dynamically:
-    // 1. From the link query parameter (?ttl=30) — ?ttl=0 forces a refresh.
-    // 2. From the stored feed TTL. A stored TTL of 0 means auto-refresh is disabled:
-    //    the feed is only fetched if never fetched, or when an explicit refresh is
-    //    requested (?ttl=0 or POST /api/feeds/:id/refresh).
-    // 3. Default to 15 minutes.
-    let ttl = feed.ttl ?? 15;
-    let force = false;
-    let disabled = false;
 
     const queryTtlRaw = req.query.ttl;
     if (queryTtlRaw !== undefined) {
@@ -493,17 +604,22 @@ router.get('/feeds/:id', async (req: Request, res: Response) => {
         res.status(400).send('Invalid ttl parameter');
         return;
       }
-      ttl = parsedTtl;
-      force = parsedTtl === 0;
-    } else if (ttl === 0) {
-      disabled = true;
+      // Explicit refresh request: ?ttl=0 forces, any other value refreshes only if stale.
+      const outcome = await feedManager.refreshFeed(id, parsedTtl, { force: parsedTtl === 0 });
+      feed = outcome.feed;
     }
 
-    // Refresh feed items cache if expired
-    const updatedFeed = await feedManager.updateFeedIfNeeded(id, ttl, { force, disabled });
+    const stale = feedManager.isFeedStale(feed);
+    res.setHeader('X-Feed-Stale', String(stale));
+    if (feed.lastFetched) {
+      res.setHeader('X-Feed-Last-Fetched', feed.lastFetched.toISOString());
+    }
+    if (stale) {
+      res.setHeader('Warning', '110 - "Response is Stale"');
+    }
 
     // Generate XML feed
-    const xml = feedGenerator.generateRssXml(updatedFeed);
+    const xml = feedGenerator.generateRssXml(feed);
 
     // Serve RSS XML
     res.header('Content-Type', 'application/xml; charset=utf-8');

@@ -3,7 +3,10 @@ import path from 'path';
 import { router } from './routes.js';
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = parseInt(process.env.PORT ?? '', 10) || 3000;
+// The API is a local service: cron ticks it over loopback. Override HOST only if you
+// deliberately want to expose it on the network.
+const host = process.env.HOST || '127.0.0.1';
 
 app.use(express.json());
 
@@ -27,6 +30,6 @@ app.get('/*splat', (req, res, next) => {
   res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
-app.listen(port, () => {
-  console.log(`[Server] RSS Aggregator Server listening at http://localhost:${port}`);
+app.listen(port, host, () => {
+  console.log(`[Server] RSS Aggregator Server listening at http://${host}:${port}`);
 });
