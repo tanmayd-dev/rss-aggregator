@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "test-endpoints": "tsx scripts/test_endpoints.ts",
     "test-browser": "tsx scripts/browser_test.ts",
+    "test-botguard": "tsx scripts/test_botguard.ts",
     "test-db": "tsx scripts/test_db_tables.ts"
   },
   "keywords": [],

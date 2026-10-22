@@ -73,9 +73,24 @@ Order matters on a fresh checkout: `npm install` -> `prisma generate` -> `migrat
 - `PUT /api/feeds/:id` rebalances the feed, then fetches new/changed sources plus any
   source already due; unchanged fresh sources are not re-scraped.
 - `POST /api/items/read` with no `ids`/`feedId` marks **every** unread item read.
+- `src/services/botGuard.ts` detects Google/YouTube bot-mitigation pages (fake
+  `Error 404!!1` / `Error 500!!1` bodies) and pauses fetches to that host for
+  `BOT_COOLDOWN_MINUTES` (default 45). Flagged sources get extended backoff in the DB;
+  while a host is cooling, the tick reports those sources as `deferred` (no request is
+  sent, not counted as attempted/failed — refresh.log one-line summaries include
+  `deferred=`). Cooldown state is in-memory, but each source's `nextRefreshAt` already
+  encodes the pause, so a restart does not re-burst flagged hosts.
+- Shorts flags (`isShort`) come from the feed link itself (`/shorts/` vs `/watch`) with
+  zero network traffic. `checkIsYoutubeShort`'s redirect probe now runs only for
+  ambiguous legacy links (concurrency 3, skipped during a cooldown), and its
+  `undefined` (undetermined) result is never cached — an old bug cached network
+  failures as `isShort: false`.
 
 ## Tests
 
+- `npm run test-botguard` — offline: bot-flag classifier (captured real Google 404/500
+  pages), host cooldown expiry/extension semantics, Shorts link derivation, and the
+  bounded-concurrency helper. Safe to run anywhere.
 - `npm run test-endpoints` — spins its own server on port 3001 (plus 3002/3003 for
   fixture feed servers). Hits the live internet (YouTube, Reddit, 4chan) and mutates
   `prisma/dev.db` (creates/deletes named test feeds, bulk-marks items read). Flaky by

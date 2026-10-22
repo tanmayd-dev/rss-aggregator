@@ -4,6 +4,7 @@ import * as feedManager from './services/feedManager.js';
 import * as feedGenerator from './services/feedGenerator.js';
 import * as scraper from './services/scraper.js';
 import { nextBudget, TICK_INTERVAL_MINUTES } from './services/scheduler.js';
+import { isCooling } from './services/botGuard.js';
 
 export const router = Router();
 
@@ -413,37 +414,25 @@ router.post('/api/feeds/test', async (req: Request, res: Response) => {
         const rawYtItems = await scraper.fetchYoutubeRss(resolvedUrl);
         const includeShorts = config?.includeShorts !== false;
 
-        // Perform parallel Shorts check for testing
-        const checkedItems = await Promise.all(
-          rawYtItems.map(async (item) => {
-            const videoId = item.extraMetadata?.videoId;
-            let isShort = false;
-            if (videoId) {
-              // Try check in DB first to save overhead, if not test it
-              const cachedItem = await prisma.feedItem.findFirst({
-                where: { link: item.link },
-              });
-              if (cachedItem && cachedItem.extraMetadata) {
-                try {
-                  const meta = JSON.parse(cachedItem.extraMetadata);
-                  if (meta.isShort !== undefined) {
-                    isShort = meta.isShort;
-                  } else {
-                    isShort = await scraper.checkIsYoutubeShort(videoId);
-                  }
-                } catch {
-                  isShort = await scraper.checkIsYoutubeShort(videoId);
-                }
-              } else {
-                isShort = await scraper.checkIsYoutubeShort(videoId);
-              }
-            }
-            return {
-              ...item,
-              extraMetadata: { ...item.extraMetadata, isShort },
-            };
-          })
-        );
+        // Shorts flags: link-derived when possible, cached DB value or (rarely) a
+        // network probe only for ambiguous legacy links — skipped while the host is
+        // in a botGuard cooldown.
+        const allowShortChecks = !isCooling('www.youtube.com');
+        const checkedItems = await scraper.mapLimit(rawYtItems, 3, async (item) => {
+          const videoId = item.extraMetadata?.videoId;
+          let isShort = await scraper.determineYoutubeShortFlag(
+            { videoId, link: item.link },
+            { allowNetwork: allowShortChecks }
+          );
+          if (isShort === undefined) {
+            // Preview-only: conservative guess keeps the include/exclude filter working.
+            isShort = false;
+          }
+          return {
+            ...item,
+            extraMetadata: { ...item.extraMetadata, isShort },
+          };
+        });
 
         if (!includeShorts) {
           items = checkedItems.filter((item) => item.extraMetadata.isShort !== true);

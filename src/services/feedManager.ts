@@ -12,6 +12,13 @@ import {
   effectiveTtl,
   RUN_RETENTION_DAYS,
 } from './scheduler.js';
+import {
+  botCooldownMinutes,
+  coolingMinutesLeft,
+  isCooling,
+  isBotFlagError,
+  recordBotFlag,
+} from './botGuard.js';
 
 export interface UpdateFeedOptions {
   /** Always re-fetch every source, ignoring TTL (explicit force refresh). */
@@ -35,6 +42,8 @@ export interface SourceFetchOutcome {
   failed: boolean;
   itemCount: number;
   error?: string;
+  /** Set when the fetch was skipped because the host is in a botGuard cooldown. */
+  deferred?: true;
 }
 
 export interface TickSourceResult extends SourceFetchOutcome {
@@ -49,6 +58,8 @@ export interface RefreshTickResult {
   attempted: number;
   succeeded: number;
   failed: number;
+  /** Sources skipped because their host is in a botGuard cooldown. */
+  deferred: number;
   durationMs: number;
   dryRun: boolean;
   results: TickSourceResult[];
@@ -183,44 +194,32 @@ async function fetchSourceItems(
       }
 
       const rawYtItems = await scraper.fetchYoutubeRss(resolvedUrl);
-      // Resolve all Shorts checks in parallel using global lookup
-      items = await Promise.all(
-        rawYtItems.map(async (rawItem) => {
-          const videoId = rawItem.extraMetadata?.videoId;
-          if (!videoId) {
-            return rawItem;
-          }
-
-          // Check if we already cached this video's Short status anywhere in DB
-          const existingItem = await prisma.feedItem.findFirst({
-            where: { link: rawItem.link },
-          });
-
-          let isShort = false;
-          if (existingItem && existingItem.extraMetadata) {
-            try {
-              const meta = JSON.parse(existingItem.extraMetadata);
-              if (meta.isShort !== undefined) {
-                isShort = meta.isShort;
-              } else {
-                isShort = await scraper.checkIsYoutubeShort(videoId);
-              }
-            } catch {
-              isShort = await scraper.checkIsYoutubeShort(videoId);
-            }
-          } else {
-            isShort = await scraper.checkIsYoutubeShort(videoId);
-          }
-
-          return {
-            ...rawItem,
-            extraMetadata: {
-              ...rawItem.extraMetadata,
-              isShort,
-            },
-          };
-        })
-      );
+      // The feed link decides the Shorts flag offline: Shorts point at /shorts/<id>,
+      // regular videos at /watch?v=<id>. Only ambiguous legacy links fall back to the
+      // network probe (capped concurrency), which is skipped entirely while the host is
+      // cooling down so a bot-flagged host is never probed and never caches a wrong
+      // value (undetermined items just omit the flag until a later refresh).
+      const allowShortChecks = !isCooling(sourceHost(source));
+      items = await scraper.mapLimit(rawYtItems, 3, async (rawItem) => {
+        const videoId = rawItem.extraMetadata?.videoId;
+        if (!videoId) {
+          return rawItem;
+        }
+        const isShort = await scraper.determineYoutubeShortFlag(
+          { videoId, link: rawItem.link },
+          { allowNetwork: allowShortChecks }
+        );
+        if (isShort === undefined) {
+          return rawItem; // leave extraMetadata untouched (no isShort guess)
+        }
+        return {
+          ...rawItem,
+          extraMetadata: {
+            ...rawItem.extraMetadata,
+            isShort,
+          },
+        };
+      });
       break;
     }
 
@@ -311,18 +310,31 @@ async function saveFailure(
   error: unknown
 ): Promise<void> {
   const failures = source.consecutiveFailures + 1;
-  const message = error instanceof Error ? error.message : String(error);
-  const nextRefreshAt =
-    ttlMinutes > 0
-      ? new Date(now.getTime() + backoffMinutes(failures, ttlMinutes) * 60_000)
-      : null;
+  const message =
+    error instanceof Error ? error.message : error ? String(error) : 'Unknown error';
+  const host = sourceHost(source);
+  const botFlagged = isBotFlagError(error);
+  if (botFlagged) {
+    // Google/YouTube bot-mitigation page: pause the whole host so the flag can cool
+    // down instead of re-confirming it every 5 minutes.
+    recordBotFlag(host, now.getTime());
+  }
+
+  let nextRefreshAt: Date | null = null;
+  if (ttlMinutes > 0) {
+    let waitMs = backoffMinutes(failures, ttlMinutes) * 60_000;
+    if (botFlagged) {
+      waitMs = Math.max(waitMs, botCooldownMinutes() * 60_000);
+    }
+    nextRefreshAt = new Date(now.getTime() + waitMs);
+  }
 
   await prisma.feedSource.update({
     where: { id: source.id },
     data: {
       lastAttemptAt: now,
       consecutiveFailures: failures,
-      lastError: message.slice(0, 500),
+      lastError: `${message}${botFlagged ? ' [Google bot-flag page]' : ''}`.slice(0, 500),
       nextRefreshAt,
     },
   });
@@ -341,6 +353,25 @@ async function refreshOneSource(
   now: Date,
   dedupCache?: Map<string, { items: ScrapedFeedItem[]; resolvedUrl: string | null }>
 ): Promise<SourceFetchOutcome> {
+  const host = sourceHost(source);
+  // While a host is cooling down after a bot-flag response, skip its sources quietly:
+  // they stay due (and visible on the dashboard) but no request is sent to the host,
+  // which lets the flag expire instead of re-confirming it every few minutes.
+  if (isCooling(host, now.getTime())) {
+    return {
+      sourceId: source.id,
+      feedId,
+      fetched: false,
+      failed: false,
+      deferred: true,
+      itemCount: 0,
+      error: `${host} cooling down (bot-flag) for ~${coolingMinutesLeft(
+        host,
+        now.getTime()
+      )} more min`,
+    };
+  }
+
   const dedupKey = buildSourceDedupKey(source);
   const cached = dedupKey ? dedupCache?.get(dedupKey) : undefined;
 
@@ -681,9 +712,10 @@ export async function runRefreshTick(
         })
       );
 
-      const attempted = results.length;
-      const succeeded = results.filter((result) => !result.failed).length;
-      const failed = results.filter((result) => result.failed).length;
+      const attempted = results.filter((result) => !result.deferred).length;
+      const deferred = results.length - attempted;
+      const succeeded = results.filter((result) => !result.deferred && !result.failed).length;
+      const failed = results.filter((result) => !result.deferred && result.failed).length;
       const durationMs = Date.now() - startedMs;
 
       await prisma.refreshRun.update({
@@ -705,7 +737,8 @@ export async function runRefreshTick(
 
       console.log(
         `[tick] due=${dueCount} budget=${budget} attempted=${attempted} ` +
-          `succeeded=${succeeded} failed=${failed} (${(durationMs / 1000).toFixed(1)}s)`
+          `succeeded=${succeeded} failed=${failed} deferred=${deferred} ` +
+          `(${(durationMs / 1000).toFixed(1)}s)`
       );
 
       return {
@@ -715,6 +748,7 @@ export async function runRefreshTick(
         attempted,
         succeeded,
         failed,
+        deferred,
         durationMs,
         dryRun: false,
         results,
@@ -727,6 +761,7 @@ export async function runRefreshTick(
       attempted: 0,
       succeeded: 0,
       failed: 0,
+      deferred: 0,
       durationMs: Date.now() - startedMs,
       dryRun: true,
       results: [],

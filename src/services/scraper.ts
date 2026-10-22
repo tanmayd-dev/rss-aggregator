@@ -2,6 +2,7 @@ import axios, { AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
 import Parser from 'rss-parser';
 import { HtmlConfig, ScrapedFeedItem, YoutubeConfig } from '../types.js';
+import { isBotFlagError } from './botGuard.js';
 
 const parser = new Parser();
 
@@ -36,6 +37,13 @@ async function getWithRetry(
       return await client.get(url);
     } catch (err: any) {
       lastError = err;
+      // Google/YouTube bot mitigation answers the same URL with the same fake error
+      // page within seconds, so immediate retries just burn requests and keep the
+      // flag hot. Tag the error and fail fast; botGuard handles the host-wide pause.
+      if (isBotFlagError(err)) {
+        err.botFlagged = true;
+        break;
+      }
       const status = err?.response?.status;
       const retriable =
         !err?.response || // network-level failure (no HTTP response received)
@@ -225,16 +233,33 @@ export async function resolveYoutubeChannel(channelUrl: string): Promise<{ resol
 }
 
 /**
- * Programmatically detects if a YouTube video is a Short using a HEAD request to checks redirect status.
+ * Decides a YouTube item's Shorts flag offline, purely from the feed link: entries for
+ * Shorts point at youtube.com/shorts/<id>, regular videos at /watch?v=<id> (or
+ * youtu.be/<id>). Returns true/false when decidable, null when ambiguous.
  */
-export async function checkIsYoutubeShort(videoId: string): Promise<boolean> {
+export function isShortLink(link?: string | null): boolean | null {
+  if (!link) return null;
+  if (/youtube\.com\/shorts\/[^/?&]{5,}/i.test(link)) return true;
+  if (/youtube\.com\/watch\?v=[^&/?]{5,}/i.test(link)) return false;
+  if (/youtu\.be\/[^/?&]{5,}/i.test(link)) return false;
+  return null;
+}
+
+/**
+ * Flag a video as a Short from the redirect it serves: a regular video 303-redirects
+ * /shorts/<id> to /watch?v=<id>, while a Short resolves inside /shorts.
+ *
+ * Returns true/false only for a confirmed answer; network failures return undefined
+ * (undetermined) instead of a default false, so a wrong value is never cached.
+ */
+export async function checkIsYoutubeShort(videoId: string): Promise<boolean | undefined> {
   try {
     const response = await client.head(`https://www.youtube.com/shorts/${videoId}`, {
       maxRedirects: 0,
       validateStatus: () => true,
       timeout: 1500, // strict timeout to prevent thread blocking
     });
-    
+
     // Status 303 See Other redirects standard videos to /watch?v=videoId
     const location = response.headers.location || '';
     if ((response.status === 303 || response.status === 302) && location.includes('/watch')) {
@@ -243,8 +268,65 @@ export async function checkIsYoutubeShort(videoId: string): Promise<boolean> {
     return true; // Resolves locally or stays in /shorts
   } catch (err) {
     console.error(`Error checking Shorts status for video ${videoId}:`, err);
-    return false; // Default to false on failure
+    return undefined; // Undetermined: callers must not persist a value from this
   }
+}
+
+/**
+ * Resolves a YouTube item's isShort flag with as little traffic as possible:
+ * 1. the feed link itself (offline, always enough for fresh channel-feed data),
+ * 2. the flag cached on any FeedItem row that already holds this link,
+ * 3. the network redirect probe (only for ambiguous legacy links).
+ *
+ * Backs off entirely while `allowNetwork` is false (e.g. a botGuard cooldown on the
+ * host) so a flagged host is never probed. Returns undefined when undetermined.
+ */
+export async function determineYoutubeShortFlag(
+  item: { videoId?: string; link?: string | null },
+  opts: { allowNetwork?: boolean } = {}
+): Promise<boolean | undefined> {
+  const offline = isShortLink(item.link);
+  if (offline !== null) return offline;
+
+  // Ambiguous link: any FeedItem row that already stored this link may know.
+  if (item.link) {
+    try {
+      const cachedItem = await prisma.feedItem.findFirst({ where: { link: item.link } });
+      if (cachedItem && cachedItem.extraMetadata) {
+        const meta = JSON.parse(cachedItem.extraMetadata);
+        if (meta.isShort !== undefined) {
+          return meta.isShort as boolean;
+        }
+      }
+    } catch (cacheErr) {
+      console.error('Error reading cached Shorts flag for link:', cacheErr);
+    }
+  }
+
+  if (!item.videoId || opts.allowNetwork === false) return undefined;
+  return checkIsYoutubeShort(item.videoId);
+}
+
+/** Run `fn` over `items` with at most `limit` concurrent calls, preserving order. */
+export async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  if (items.length === 0) return results;
+
+  let next = 0;
+  const concurrency = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await fn(items[index], index);
+      }
+    })
+  );
+  return results;
 }
 
 /**
