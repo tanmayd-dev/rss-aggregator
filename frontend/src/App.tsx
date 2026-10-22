@@ -4,7 +4,7 @@ import {
   RefreshCw, AlertCircle, Link, Rss, Youtube, 
   MessageSquare, Globe, X, ExternalLink, Settings,
   Inbox, MailOpen, CheckCheck, ChevronDown, ChevronUp,
-  Activity, Clock
+  Activity, Clock, AlertTriangle
 } from 'lucide-react';
 import { Feed, FeedItem, FeedType, ScrapedFeedItem, RefreshRun, RefreshRunsResponse } from './types.js';
 import RefreshChart from './components/RefreshChart.js';
@@ -289,6 +289,7 @@ export default function App() {
       );
       fetchFeeds();
     } catch (err: any) {
+      await fetchFeeds();
       alert(`Error refreshing source: ${err.message}`);
     } finally {
       setRefreshingSourceId(null);
@@ -456,6 +457,20 @@ export default function App() {
     return minutes > 0 ? `in ~${minutes}m` : 'due now';
   })();
 
+  // Sources whose last attempt failed, worst first
+  const failedSources = feeds
+    .flatMap((feed) =>
+      feed.sources
+        .filter((source) => (source.consecutiveFailures ?? 0) > 0)
+        .map((source) => ({ feed, source }))
+    )
+    .sort(
+      (a, b) =>
+        (b.source.consecutiveFailures ?? 0) - (a.source.consecutiveFailures ?? 0) ||
+        a.feed.name.localeCompare(b.feed.name) ||
+        (a.source.url || '').localeCompare(b.source.url || '')
+    );
+
   // Strip HTML tags for the item snippet
   const stripHtml = (html: string) => html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -619,6 +634,82 @@ export default function App() {
             </div>
           )}
         </div>
+
+        {/* FAILING SOURCES */}
+        {failedSources.length > 0 && (
+          <div className="mb-6 bg-white dark:bg-gray-900 border border-red-200 dark:border-red-900/60 rounded-xl shadow-sm overflow-hidden">
+            <div className="px-6 py-3 flex items-center justify-between gap-4 border-b border-red-100 dark:border-red-900/40 bg-red-50/60 dark:bg-red-950/20">
+              <span className="flex items-center gap-2 font-semibold text-sm text-red-800 dark:text-red-300">
+                <AlertTriangle className="w-4 h-4" />
+                <span>Failing sources</span>
+                <span className="inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-red-600 text-white text-[10px] font-bold">
+                  {failedSources.length}
+                </span>
+              </span>
+              <button
+                onClick={fetchFeeds}
+                disabled={loading}
+                className="p-1.5 text-red-500 hover:text-red-700 dark:text-red-400 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/30 transition disabled:opacity-50"
+                title="Reload failure status"
+              >
+                <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+              </button>
+            </div>
+            <ul className="divide-y divide-gray-200 dark:divide-gray-800 max-h-96 overflow-y-auto">
+              {failedSources.map(({ feed, source }) => {
+                const failures = source.consecutiveFailures ?? 0;
+                const retrying = refreshingSourceId === source.id;
+                return (
+                  <li key={source.id ?? `${feed.id}:${source.url}`} className="px-6 py-3">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-semibold text-sm">{feed.name}</span>
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold leading-none ${getBadgeClass(source.type)}`}>
+                            {getPlatformIcon(source.type)}
+                            <span className="capitalize">
+                              {source.type === 'fourchan' ? '4chan' : source.type === 'html' ? 'Custom HTML' : source.type}
+                            </span>
+                          </span>
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">
+                            {failures} failure{failures === 1 ? '' : 's'}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-xs text-gray-500 dark:text-gray-400 truncate" title={source.url}>
+                          {source.resolvedUrl || source.url || 'No URL'}
+                        </div>
+                        {source.lastError && (
+                          <div
+                            className="mt-1 text-xs text-red-600 dark:text-red-400 line-clamp-2"
+                            title={source.lastError}
+                          >
+                            {source.lastError}
+                          </div>
+                        )}
+                      </div>
+                      <div className="shrink-0 text-[11px] text-gray-500 dark:text-gray-400 sm:text-right">
+                        <div>last attempt {formatDate(source.lastAttemptAt ?? null)}</div>
+                        <div>next retry {formatDate(source.nextRefreshAt ?? null)}</div>
+                        {source.id && (
+                          <button
+                            type="button"
+                            onClick={() => handleRefreshSource(source.id!)}
+                            disabled={retrying}
+                            className="mt-1 inline-flex items-center gap-1 font-semibold text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 disabled:opacity-50"
+                            title="Retry this source now"
+                          >
+                            <RefreshCw className={`w-3 h-3 ${retrying ? 'animate-spin' : ''}`} />
+                            Retry now
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
 
         {/* FEED TABLE LIST */}
         <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl overflow-hidden shadow-sm">
