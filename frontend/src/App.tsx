@@ -555,7 +555,7 @@ export default function App() {
                   <span>budget {activityBudget}</span>
                   <span aria-hidden="true">·</span>
                   <span>
-                    last tick {activityLastRun.attempted}/{activityLastRun.budget}
+                    last tick {activityLastRun.attempted} of {activityLastRun.budget}
                   </span>
                   {activityLastRun.due > activityLastRun.budget && (
                     <>
@@ -609,7 +609,13 @@ export default function App() {
                 <div className="mb-3 text-xs text-red-600 dark:text-red-400">{runsError}</div>
               )}
 
-              <RefreshChart runs={runs} rangeHours={runsRange} />
+              <RefreshChart
+                runs={runs}
+                rangeHours={runsRange}
+                currentBudget={runsMeta?.currentBudget}
+                dueNow={runsMeta?.dueNow}
+                tickIntervalMinutes={runsMeta?.tickIntervalMinutes}
+              />
             </div>
           )}
         </div>

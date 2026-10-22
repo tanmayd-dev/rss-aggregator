@@ -95,6 +95,7 @@ export interface RefreshRun {
 export interface RefreshRunsResponse {
   runs: RefreshRun[];
   lastRun: RefreshRun | null;
+  dueNow: number;
   currentBudget: number;
   tickIntervalMinutes: number;
   running: boolean;

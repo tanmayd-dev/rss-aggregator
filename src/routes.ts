@@ -530,19 +530,27 @@ router.get('/api/refresh/runs', async (req: Request, res: Response) => {
     const requested = parseInt(req.query.hours as string, 10);
     const hours = Number.isNaN(requested) ? 24 : Math.min(Math.max(requested, 1), 168);
     const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+    const now = new Date();
 
-    const [runs, lastRun] = await Promise.all([
+    const [runs, lastRun, dueNow] = await Promise.all([
       prisma.refreshRun.findMany({
         where: { startedAt: { gte: since } },
         orderBy: { startedAt: 'asc' },
         take: 5000,
       }),
       prisma.refreshRun.findFirst({ orderBy: { startedAt: 'desc' } }),
+      prisma.feedSource.count({
+        where: {
+          feed: { ttl: { gt: 0 } },
+          OR: [{ nextRefreshAt: null }, { nextRefreshAt: { lte: now } }],
+        },
+      }),
     ]);
 
     res.json({
       runs,
       lastRun,
+      dueNow,
       currentBudget: nextBudget(lastRun?.attempted),
       tickIntervalMinutes: TICK_INTERVAL_MINUTES,
       running: feedManager.isTickRunning(),

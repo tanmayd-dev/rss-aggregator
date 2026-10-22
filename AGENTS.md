@@ -62,8 +62,9 @@ Order matters on a fresh checkout: `npm install` -> `prisma generate` -> `migrat
   `lastAttemptAt`, `consecutiveFailures`, `lastError`). Adding/removing sources or
   changing the TTL rebalances every source in that feed (`rebalanceFeed`). Failed
   sources retry with exponential backoff (5, 10, 20 … capped at `min(TTL, 60)` min).
-- The tick budget adapts to the previous tick: `max(4, ceil(previousAttempted * 1.5))`,
-  capped by `REFRESH_MAX_PER_TICK` (default 64). That drains a post-downtime backlog
+- The tick budget adapts to the previous tick:
+  `max(4, ceil(previousAttempted * REFRESH_BUDGET_GROWTH))` (default 1.25x), capped by
+  `REFRESH_MAX_PER_TICK` (default 64). That drains a post-downtime backlog gradually
   while keeping normal ticks small. Each tick is recorded in `RefreshRun` (pruned after
   7 days) and graphed by the dashboard's "Refresh activity" panel.
 - Plain `GET /feeds/:id` is cache-only and never scrapes. Passing `?ttl=` explicitly

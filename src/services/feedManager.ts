@@ -4,10 +4,10 @@ import * as scraper from './scraper.js';
 import { HtmlConfig, FourChanConfig, ScrapedFeedItem } from '../types.js';
 import {
   backoffMinutes,
-  computeNextRefreshAt,
   nextBudget,
   nextRefreshAfterFetch,
   orderSources,
+  planRebalance,
   sourceHost,
   effectiveTtl,
   RUN_RETENTION_DAYS,
@@ -399,15 +399,11 @@ export async function rebalanceFeed(feedId: string, now: Date = new Date()): Pro
   if (!feed) return;
 
   const ordered = orderSources(feed.sources);
-  const updates = ordered.map((source, index) =>
+  const plan = planRebalance(feed.sources, feed.ttl, now);
+  const updates = ordered.map((source) =>
     prisma.feedSource.update({
       where: { id: source.id },
-      data: {
-        nextRefreshAt:
-          feed.ttl > 0
-            ? computeNextRefreshAt(source, index, ordered.length, feed.ttl, now)
-            : null,
-      },
+      data: { nextRefreshAt: plan.get(source.id) ?? null },
     })
   );
 
@@ -575,7 +571,8 @@ export async function runRefreshTick(
     const initial = await prisma.feed.findMany({ include: { sources: true }, orderBy: { createdAt: 'asc' } });
     for (const feed of initial) {
       const unscheduled = feed.sources.some((source) => source.nextRefreshAt === null);
-      if (unscheduled) {
+      // TTL 0 feeds intentionally have no schedule; only rebalance automatic feeds.
+      if (feed.ttl > 0 && unscheduled) {
         await rebalanceFeed(feed.id, now);
       }
     }

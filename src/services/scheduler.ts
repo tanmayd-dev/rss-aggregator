@@ -16,6 +16,11 @@ import { FeedSource } from '@prisma/client';
 export const TICK_INTERVAL_MINUTES = 5;
 export const MIN_PER_TICK = 4;
 export const DEFAULT_MAX_PER_TICK = 64;
+/**
+ * How fast the adaptive budget grows after a backlog. A gentler multiplier keeps a
+ * post-downtime catch-up from hammering many sources at once.
+ */
+export const DEFAULT_BUDGET_GROWTH = 1.25;
 export const BACKOFF_BASE_MINUTES = 5;
 export const BACKOFF_MAX_MINUTES = 60;
 export const RUN_RETENTION_DAYS = 7;
@@ -24,6 +29,12 @@ export function maxPerTick(): number {
   const parsed = parseInt(process.env.REFRESH_MAX_PER_TICK ?? '', 10);
   if (Number.isNaN(parsed) || parsed < MIN_PER_TICK) return DEFAULT_MAX_PER_TICK;
   return parsed;
+}
+
+/** Multiplier applied to the previous tick's attempted count. */
+export function budgetGrowth(): number {
+  const parsed = parseFloat(process.env.REFRESH_BUDGET_GROWTH ?? '');
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_BUDGET_GROWTH;
 }
 
 /** Shortest TTL the scheduler can honor given the 5-minute tick. */
@@ -65,52 +76,91 @@ export function minSourceIntervalMinutes(ttlMinutes: number, count: number): num
   return Math.max(TICK_INTERVAL_MINUTES, effectiveTtl(ttlMinutes) / Math.max(1, count));
 }
 
-export interface SchedulableSource {
+export interface RebalanceSource {
+  id: string;
+  createdAt: Date;
   lastFetched: Date | null;
-  nextRefreshAt: Date | null;
 }
 
 /**
- * Slot for a source when the feed is (re)balanced: sources added, removed or a TTL
- * change shift everyone's phase. A source is never scheduled sooner than its fair
- * share after its last success, and never later than its TTL deadline.
+ * Assign every source of a feed its next refresh time.
+ *
+ * Sources still comfortably inside their TTL keep their canonical slot, so they stay
+ * evenly spread and clock-aligned. Sources whose own slot would land past their TTL
+ * deadline are caught up on the earliest free 5-minute ticks instead of all being
+ * clamped onto the same deadline — which would create a burst every time a feed is
+ * edited or the server comes back from downtime. After the catch-up fetch, a source
+ * re-anchors to its canonical phase via nextRefreshAfterFetch().
  */
-export function computeNextRefreshAt(
-  source: Pick<SchedulableSource, 'lastFetched'>,
-  index: number,
-  count: number,
+export function planRebalance(
+  sources: RebalanceSource[],
   ttlMinutes: number,
   now: Date = new Date()
-): Date {
+): Map<string, Date | null> {
+  const plan = new Map<string, Date | null>();
+
   if (ttlMinutes <= 0) {
-    return new Date(now.getTime() + effectiveTtl(ttlMinutes) * 60_000);
+    for (const source of sources) plan.set(source.id, null);
+    return plan;
   }
 
-  // Never-fetched sources are due immediately so a failed seed gets retried.
-  if (!source.lastFetched) {
-    return now;
-  }
-
+  const ordered = orderSources(sources);
+  const count = ordered.length;
+  const ttl = effectiveTtl(ttlMinutes);
+  const ttlMs = ttl * 60_000;
+  const tickMs = TICK_INTERVAL_MINUTES * 60_000;
   const nowMs = now.getTime();
-  const lastFetchedMs = source.lastFetched.getTime();
-  const minIntervalMs = minSourceIntervalMinutes(ttlMinutes, count) * 60_000;
-  // Allow snapping to a slot up to one tick early so sources stay on the 5-minute
-  // grid instead of drifting to arbitrary "last fetch + ttl" timestamps.
-  const earliest = Math.max(
-    nowMs,
-    lastFetchedMs + minIntervalMs - TICK_INTERVAL_MINUTES * 60_000
-  );
 
-  let candidate = nextSlotAtOrAfter(earliest, index, count, ttlMinutes);
-  const deadline = lastFetchedMs + effectiveTtl(ttlMinutes) * 60_000;
-  if (candidate > deadline) {
-    // Never let a source exceed its TTL: fall back to the TTL deadline, rounded down
-    // to the tick grid (fetching slightly early beats serving stale data).
-    const tickMs = TICK_INTERVAL_MINUTES * 60_000;
-    candidate = Math.max(nowMs, Math.floor(deadline / tickMs) * tickMs);
-  }
+  const taken = new Set<number>();
+  const overdue: {
+    source: RebalanceSource;
+    earliest: number;
+    deadline: number;
+    createdAt: number;
+  }[] = [];
 
-  return new Date(candidate);
+  ordered.forEach((source, index) => {
+    // A never-fetched source is due immediately so seeding cannot wait a whole TTL.
+    if (!source.lastFetched) {
+      plan.set(source.id, now);
+      return;
+    }
+
+    const lastFetchedMs = source.lastFetched.getTime();
+    const deadline = lastFetchedMs + ttlMs;
+    const minIntervalMs = minSourceIntervalMinutes(ttlMinutes, count) * 60_000;
+    // Allow snapping one tick early so slots stay on the 5-minute grid.
+    const earliest = Math.max(nowMs, lastFetchedMs + minIntervalMs - tickMs);
+    const preferred = nextSlotAtOrAfter(nowMs, index, count, ttlMinutes);
+
+    if (preferred >= earliest && preferred <= deadline) {
+      let slot = preferred;
+      // Feeds with more sources than slots share a slot; push duplicates to the next
+      // window instead of dropping them.
+      while (taken.has(slot)) slot += ttlMs;
+      taken.add(slot);
+      plan.set(source.id, new Date(slot));
+      return;
+    }
+
+    overdue.push({ source, earliest, deadline, createdAt: source.createdAt.getTime() });
+  });
+
+  overdue
+    .sort(
+      (a, b) =>
+        a.deadline - b.deadline ||
+        a.createdAt - b.createdAt ||
+        a.source.id.localeCompare(b.source.id)
+    )
+    .forEach(({ source, earliest }) => {
+      let slot = Math.ceil(Math.max(nowMs, earliest) / tickMs) * tickMs;
+      while (taken.has(slot)) slot += tickMs;
+      taken.add(slot);
+      plan.set(source.id, new Date(slot));
+    });
+
+  return plan;
 }
 
 /** Slot for a source that was just fetched successfully (strictly after `now`). */
@@ -135,14 +185,15 @@ export function backoffMinutes(consecutiveFailures: number, ttlMinutes: number):
 }
 
 /**
- * Adaptive tick budget: the previous tick's actual work grows by 1.5x (so a backlog
- * drains) but never drops below MIN_PER_TICK or exceeds the hard ceiling.
+ * Adaptive tick budget: the previous tick's actual work grows by
+ * `REFRESH_BUDGET_GROWTH` (default 1.25x) so a backlog drains gradually, while
+ * normal ticks stay small. Never drops below MIN_PER_TICK or exceeds the ceiling.
  */
 export function nextBudget(previousAttempted: number | null | undefined): number {
   if (previousAttempted === null || previousAttempted === undefined) return MIN_PER_TICK;
   return Math.min(
     maxPerTick(),
-    Math.max(MIN_PER_TICK, Math.ceil(previousAttempted * 1.5))
+    Math.max(MIN_PER_TICK, Math.ceil(previousAttempted * budgetGrowth()))
   );
 }
 

@@ -10,8 +10,9 @@ Self-hosted feed aggregator that merges **RSS, scraped websites, Reddit, YouTube
   - `reddit` — any subreddit (`r/selfhosted` or full URL)
   - `youtube` — channels, handles, or existing feed URLs, with optional **Shorts filtering** (HEAD-request detection + DB-cached channel resolution)
   - `4chan` — catalog search with wildcard queries, ranked by reply count
-- **Cron-driven refresh** — a 15-minute crontab entry refreshes feeds whose TTL has elapsed; the API server stays idle and only does staleness-checked work on explicit requests
-- **Smart refresh** — per-feed TTL caching (`0` = on-demand only), staleness-gated refreshes, and duplicate-source fetch deduplication
+- **Cron-driven refresh** — a 5-minute crontab entry ticks the refresh API; each feed's sources are spread evenly across its TTL and aligned to clock boundaries, so refreshes stay gentle on rate limits
+- **Smart refresh** — per-feed TTL caching (`0` = on-demand only), per-source scheduling with exponential failure backoff, adaptive per-tick budget, and duplicate-source fetch deduplication
+- **Refresh activity graph** — the dashboard plots each tick's attempted sources, adaptive budget, due backlog and failures
 - **Reader UI** — paginated reader with unread badges/counts, unread-only filter, single/bulk mark-as-read, live source tester, dark mode
 - **Public RSS output** — every feed gets a shareable `GET /feeds/:id` RSS 2.0 endpoint (latest 50 items, newest first)
 - **Resilient scraping** — retries with backoff, desktop user-agents, relative-URL resolution
@@ -86,8 +87,9 @@ Consequences:
 - Each feed's sources are spread evenly across its TTL window, aligned to the UTC clock:
   a 1h feed with 4 sources refreshes one source every 15 minutes (`xx:00`, `xx:15`, …).
   The 5-minute cron tick is the granularity, so TTLs below 5 are effectively 5.
-- Each tick's budget adapts to the previous tick (`max(4, previous × 1.5)`, capped at
-  `REFRESH_MAX_PER_TICK`, default 64), so a backlog drains over a few ticks.
+- Each tick's budget adapts to the previous tick (`max(4, previous × 1.25)`, capped at
+  `REFRESH_MAX_PER_TICK`, default 64; growth is tunable via `REFRESH_BUDGET_GROWTH`), so
+  a backlog drains over several ticks instead of a burst.
 - `ttl = 0` feeds are skipped by the tick (except never-fetched sources are seeded) and
   refresh only via `POST /api/feeds/:id/refresh`, a per-source refresh, or
   `GET /feeds/:id?ttl=0`.
