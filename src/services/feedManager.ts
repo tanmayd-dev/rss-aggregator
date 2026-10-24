@@ -152,7 +152,9 @@ async function fetchSourceItems(
   switch (source.type) {
     case 'rss': {
       resolvedUrl = source.url;
-      const rssParser = new (await import('rss-parser')).default();
+      // rss-parser defaults to a 60s request timeout; the 10s axios timeout used by
+      // every other fetch caps how long a slow host can stall its refresh chain.
+      const rssParser = new (await import('rss-parser')).default({ timeout: 10_000 });
       const rssFeed = await rssParser.parseURL(source.url);
       items = rssFeed.items.map((item) => ({
         title: item.title || 'Untitled Post',

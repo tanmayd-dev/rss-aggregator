@@ -100,6 +100,25 @@ Consequences:
 - The server binds `127.0.0.1` by default; set `HOST=0.0.0.0` only if you want LAN
   access (the tick endpoint additionally rejects non-loopback requests).
 
+### Deploy (Docker)
+
+```bash
+docker build -t rss-aggregator .
+docker run -d --name rss-aggregator -p 3000:3000 rss-aggregator
+```
+
+Migrations run automatically on each container start (`prisma migrate deploy`), the
+API is served on port 3000 with `HOST=0.0.0.0`, and SQLite data lives at
+`/app/data/db.sqlite`. Mount a volume to persist it across container upgrades:
+
+```bash
+docker run -d -p 3000:3000 -v rss-data:/app/data rss-aggregator
+```
+
+Note: the container ships no cron entry, so automatic refresh ticks do not run
+unless you add one (e.g. a host cron `docker exec` that POSTs to
+`http://127.0.0.1:3000/api/refresh/tick` from inside the container).
+
 ## API Reference
 
 | Method | Endpoint | Description |

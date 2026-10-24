@@ -27,7 +27,9 @@ app.get('/*splat', (req, res, next) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/feeds')) {
     return next();
   }
-  res.sendFile(path.join(frontendDistPath, 'index.html'));
+  // dotfiles must be allowed because this repo commonly sits under ~/.local:
+  // send's default ('ignore') 404s any absolute path containing a dot-directory.
+  res.sendFile(path.join(frontendDistPath, 'index.html'), { dotfiles: 'allow' });
 });
 
 app.listen(port, host, () => {

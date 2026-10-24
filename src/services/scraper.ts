@@ -1,4 +1,4 @@
-import axios, { AxiosResponse } from 'axios';
+import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
 import Parser from 'rss-parser';
 import { HtmlConfig, ScrapedFeedItem, YoutubeConfig } from '../types.js';
@@ -26,15 +26,16 @@ const client = axios.create({
  */
 async function getWithRetry(
   url: string,
-  opts: { attempts?: number; baseDelayMs?: number } = {}
+  opts: { attempts?: number; baseDelayMs?: number; instance?: AxiosInstance } = {}
 ): Promise<AxiosResponse> {
   const attempts = opts.attempts ?? 5;
   const baseDelayMs = opts.baseDelayMs ?? 500;
+  const requester = opts.instance ?? client;
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await client.get(url);
+      return await requester.get(url);
     } catch (err: any) {
       lastError = err;
       // Google/YouTube bot mitigation answers the same URL with the same fake error
@@ -375,7 +376,8 @@ export async function fetchRedditRss(subredditInput: string): Promise<ScrapedFee
 
   const rssUrl = `https://www.reddit.com/${sub}/.rss`;
   
-  // Reddit strictly blocks generic client user agents
+  // Reddit also serves transient bot/rate-limit responses (403/429) that a retry
+  // seconds later with the same URL succeeds, so reuse the shared retry ladder.
   const redditClient = axios.create({
     headers: {
       'User-Agent': 'RSS-Aggregator/1.0.0 (by /u/deshp; contact support if needed)',
@@ -383,7 +385,7 @@ export async function fetchRedditRss(subredditInput: string): Promise<ScrapedFee
     timeout: 10000,
   });
 
-  const response = await redditClient.get(rssUrl);
+  const response = await getWithRetry(rssUrl, { instance: redditClient });
   const feed = await parser.parseString(response.data);
 
   return feed.items.map((item) => {

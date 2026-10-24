@@ -90,14 +90,15 @@ Order matters on a fresh checkout: `npm install` -> `prisma generate` -> `migrat
 
 - `npm run test-botguard` — offline: bot-flag classifier (captured real Google 404/500
   pages), host cooldown expiry/extension semantics, Shorts link derivation, and the
-  bounded-concurrency helper. Safe to run anywhere.
+  bounded-concurrency helper. Safe to run anywhere. **`npm test` runs this suite.**
 - `npm run test-endpoints` — spins its own server on port 3001 (plus 3002/3003 for
   fixture feed servers). Hits the live internet (YouTube, Reddit, 4chan) and mutates
   `prisma/dev.db` (creates/deletes named test feeds, bulk-marks items read). Flaky by
   nature; not offline-safe.
 - `npm run test-browser` — Playwright on port 3002; requires `npx playwright install chromium`.
 - `frontend` `lint` script exists but there is no ESLint config — it will fail. Ignore it.
-- There is no CI.
+- CI: `.github/workflows/ci.yml` builds both npm projects and runs the offline test
+  suite (`npm test`) and `npm run build` on every push/PR.
 
 ## Deployment
 
