@@ -32,6 +32,10 @@ COPY prisma.config.ts ./
 COPY prisma ./prisma
 COPY --from=backend /app/dist ./dist
 COPY --from=frontend /app/frontend/dist ./frontend/dist
+# The backend stage's generated client lives in its own node_modules and is
+# discarded; npm 12 does not run @prisma/client's postinstall hook by default,
+# so `npm ci` alone leaves `.prisma/client` missing at runtime. Generate here.
+RUN npx prisma generate
 EXPOSE 3000
 # Migrations must run against the (optionally mounted) database inside the
 # container before the server can start.
