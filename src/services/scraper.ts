@@ -380,7 +380,7 @@ export async function fetchRedditRss(subredditInput: string): Promise<ScrapedFee
   // seconds later with the same URL succeeds, so reuse the shared retry ladder.
   const redditClient = axios.create({
     headers: {
-      'User-Agent': 'RSS-Aggregator/1.0.0 (by /u/deshp; contact support if needed)',
+      'User-Agent': 'RSS-Aggregator/1.0.0 (self-hosted feed aggregator; contact the instance admin)',
     },
     timeout: 10000,
   });
