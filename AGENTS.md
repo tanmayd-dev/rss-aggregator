@@ -10,6 +10,8 @@ reintroduce it (no `src/zen/`, no `zen/`, no Windows service code, no `keep_aliv
 Two separate npm projects (not a workspace): repo root = backend, `frontend/` = UI.
 Each needs its own `npm install`.
 
+The repository is licensed `GPL-3.0-or-later`.
+
 ## Build & run
 
 ```bash

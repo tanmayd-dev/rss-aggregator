@@ -159,3 +159,7 @@ frontend/src/           # React reader UI (feed table, reader modal, editor, act
 scripts/                # Endpoint, browser, and DB test scripts
 systemd/                # API service unit + installer (also installs the cron job)
 ```
+
+## License
+
+This project is licensed under `GPL-3.0-or-later` — see the [LICENSE](LICENSE) file for details.
